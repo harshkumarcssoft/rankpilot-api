@@ -49,8 +49,14 @@ class CrawlIn(BaseModel):
     max_pages: int = Field(default=100, ge=1, le=100000)
     delay: float = Field(default=1.0, ge=0.5, le=30)
     use_sitemap: bool = True
+    respect_robots: bool = True
     render_js: bool = False
+    user_agent: str = Field(default="SiteAuditCrawler/1.0 (+authorised technical SEO audit)", min_length=3, max_length=300)
+    include_patterns_text: str = Field(default="", max_length=20000)
+    exclude_patterns_text: str = Field(default="", max_length=20000)
     url_import_text: str = Field(default="", max_length=200000)
+    url_import_file_base64: str = Field(default="", max_length=6000000)
+    url_import_filename: str = Field(default="", max_length=255)
     feed_urls_text: str = Field(default="", max_length=10000)
     use_previous_crawl: bool = True
 
@@ -108,10 +114,32 @@ def start_crawl(project_id: str, body: CrawlIn):
     output=folder/'seo_audit_report.xlsx'; progress=folder/'progress.json'; log=folder/'crawler.log'
     cmd=[sys.executable,str(BASE/'seo_crawler.py'),url,'--max-pages',str(body.max_pages),'--delay',str(body.delay),'--output',str(output),'--progress',str(progress)]
     if not body.use_sitemap: cmd.append('--no-sitemap')
+    if not body.respect_robots: cmd.append('--ignore-robots')
     if body.render_js: cmd.append('--render-js')
+    cmd.extend(['--user-agent', body.user_agent.strip()])
+    for pattern in body.include_patterns_text.splitlines():
+        pattern=pattern.strip()
+        if pattern: cmd.extend(['--include', pattern])
+    for pattern in body.exclude_patterns_text.splitlines():
+        pattern=pattern.strip()
+        if pattern: cmd.extend(['--exclude', pattern])
     if body.url_import_text.strip():
         import_file=folder/'manual_urls.txt'
         import_file.write_text(body.url_import_text,encoding='utf-8')
+        cmd.extend(['--url-file',str(import_file)])
+    if body.url_import_file_base64.strip():
+        import base64, binascii
+        suffix=Path(body.url_import_filename or 'url-inventory.txt').suffix.lower()
+        if suffix not in {'.txt','.csv','.xlsx','.xlsm'}:
+            raise HTTPException(400,'URL inventory files must be .txt, .csv, .xlsx or .xlsm.')
+        try:
+            file_bytes=base64.b64decode(body.url_import_file_base64,validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400,'The URL inventory file could not be decoded. Please reselect the file and try again.')
+        if len(file_bytes)>4_000_000:
+            raise HTTPException(413,'URL inventory files must be 4 MB or smaller.')
+        import_file=folder/('manual_inventory'+suffix)
+        import_file.write_bytes(file_bytes)
         cmd.extend(['--url-file',str(import_file)])
     for feed in body.feed_urls_text.splitlines():
         feed=feed.strip()
@@ -174,10 +202,22 @@ def crawl_pages(crawl_id: str, limit: int=100000, offset: int=0):
                 d={h:(v.isoformat() if hasattr(v,'isoformat') else v) for h,v in zip(dheaders,values) if h}
                 if d.get('Address'): diagnostics[str(d['Address'])]=d
         it=ws.iter_rows(values_only=True); headers=[str(x) if x is not None else '' for x in next(it,[])]; rows=[]
+        # Keep the dashboard response focused: large visible-text/raw JSON fields remain
+        # available in the paginated Data Explorer and full Excel workbook, not duplicated
+        # into every dashboard page payload.
+        from seo_crawler import HEADERS as BASE_PAGE_HEADERS
+        dashboard_page_fields={
+            'Page Data: Image data JSON','Page Data: Links data JSON','Page Data: Structured data JSON',
+            'Page Data: Resources JSON','Page Data: Forms JSON','Page Data: Hreflang links JSON',
+            'Page Data: Accessibility signals JSON','Page Data: Local SEO presence signals JSON',
+            'Page Data: Open Graph JSON','Page Data: Twitter card JSON','Page Data: Headings JSON',
+            'Page Data: Viewport','Page Data: Extraction notes'
+        }
+        keep_headers=set(BASE_PAGE_HEADERS)|dashboard_page_fields
         for idx,values in enumerate(it):
             if idx < offset: continue
             if len(rows)>=max(1,min(limit,100000)): break
-            row={h:(v.isoformat() if hasattr(v,'isoformat') else v) for h,v in zip(headers,values) if h}
+            row={h:(v.isoformat() if hasattr(v,'isoformat') else v) for h,v in zip(headers,values) if h and h in keep_headers}
             if row.get('Address'):
                 row['__diagnostics']=diagnostics.get(str(row['Address']),{})
                 rows.append(row)

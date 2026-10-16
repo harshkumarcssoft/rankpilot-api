@@ -5,7 +5,7 @@
 This package has the application files at the repository root (not nested inside an extra folder) and includes a combined `requirements.txt` for platforms that expect that filename. For the local setup, use the dedicated requirement files listed below.
 
 
-This build connects the React/Vite dashboard to the existing Python SEO crawler through a local FastAPI service. Projects and crawl history are saved in a local SQLite database. Crawl reports retain the `1 - All` worksheet, keep baseline fields first, and automatically include every additional collected field; there is no fixed 75-column limit.
+This build connects the React/Vite dashboard to the Python SEO crawler through FastAPI. Projects and crawl history are stored in SQLite and reports are Excel workbooks. The main `1 - All` worksheet retains baseline fields first and dynamically appends every additional collected field; there is no fixed 75-column limit. The dashboard's Data Explorer reads workbook sheets dynamically, and URL Discovery now exposes the URL inventory, source diagnostics, and crawl summary.
 
 
 ## Deployment (Vercel frontend + Render API)
@@ -83,6 +83,7 @@ Open the local URL Vite prints, normally `http://localhost:5173/`.
 - This crawler does not render JavaScript and does not implement true pause/resume. Stop is supported.
 - The queue count reflects URLs currently waiting in the crawler queue; the ETA is an estimate based on observed speed and the requested limit.
 - The API has no user authentication or per-user/project authorization. Do not use it for confidential client data or unrestricted public access as-is. Before production use, add authentication, crawl quotas, stronger SSRF protections, durable job processing, and managed report storage.
+- Core Web Vitals/Lighthouse measurements and authorized Search Console, Analytics, backlink, CMS and server-log integrations are not fabricated. Their data-source status is marked as not connected/unavailable until the corresponding authorized integration is implemented.
 - The PDF control uses browser print-to-PDF. Some advanced dashboard panels are only as complete as the source crawler data.
 
 ## API endpoints
@@ -135,4 +136,4 @@ Then open Settings in the dashboard, enable **JavaScript rendering**, and start 
 - Historical comparison UI no longer shows invented sample numbers. Automated crawl-to-crawl diffing remains unimplemented and is labelled as such.
 - External Search Console / Analytics integrations are labelled disconnected until credentials and integration code are configured.
 
-Validation performed for this package: Python compilation passed; 10 API/crawler tests passed, including project creation, JSON health responses, workbook endpoints, and a Vercel-origin CORS preflight. A production Vite build could not be verified in this environment because the npm registry could not be reached (DNS `EAI_AGAIN`), so run the Vercel build after uploading. The live Render/Vercel deployment has not been tested from this package build.
+Validation performed for this package: Python compilation passed; 15 API/crawler tests passed, including project creation, JSON health responses, workbook endpoints, Vercel-origin CORS preflight, challenge-page handling, include/exclude matching, and a mocked multi-URL crawl discovered through a sitemap and recursive internal links, and dashboard settings/inventory-file parameters passed to the crawler. JSX was transpile-parsed with the installed TypeScript compiler and reported no syntax diagnostics. A production Vite build could not be run here because frontend npm dependencies were not available in this environment; the live Render/Vercel deployment must still be tested after upload.

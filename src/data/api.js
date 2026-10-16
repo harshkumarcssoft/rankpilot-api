@@ -31,6 +31,8 @@ async function request(path, options = {}) {
   return payload;
 }
 
+export const apiRequest = request;
+
 export const auditApi = {
   health: () => request('/health'),
   projects: () => request('/projects'),

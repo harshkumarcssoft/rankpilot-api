@@ -18,8 +18,8 @@ def test_dashboard_can_list_and_read_all_workbook_sheets():
     wb = Workbook()
     main = wb.active
     main.title = "1 - All"
-    main.append(["Address", "Status Code", "Page Data: Image data JSON", "A future dynamic field"])
-    main.append(["https://example.com/", 200, "[]", "kept"])
+    main.append(["Address", "Status Code", "Page Data: Image data JSON", "Page Data: Visible text", "A future dynamic field"])
+    main.append(["https://example.com/", 200, "[{\"src\":\"https://example.com/a.png\",\"alt\":\"Example\",\"alt_present\":true}]", "A very long page body that belongs in the paginated data explorer", "kept"])
     for name, headers, values in [
         ("Page Data", ["Address", "Visible text", "H1 count"], ["https://example.com/", "Example page", 1]),
         ("URL Discovery", ["URL", "Discovery source", "Discovery status"], ["https://example.com/", "seed_url", "crawled"]),
@@ -44,6 +44,11 @@ def test_dashboard_can_list_and_read_all_workbook_sheets():
         assert all_sheet.status_code == 200
         assert "A future dynamic field" in all_sheet.json()["headers"]
         assert all_sheet.json()["items"][0]["A future dynamic field"] == "kept"
+        pages = client.get(f"/api/crawls/{crawl_id}/pages")
+        assert pages.status_code == 200
+        page_item = pages.json()["items"][0]
+        assert "Page Data: Image data JSON" in page_item
+        assert "Page Data: Visible text" not in page_item
         discovery = client.get(f"/api/crawls/{crawl_id}/sheets/URL%20Discovery?limit=10")
         assert discovery.status_code == 200
         assert discovery.json()["items"][0]["Discovery source"] == "seed_url"

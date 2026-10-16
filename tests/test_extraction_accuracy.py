@@ -82,3 +82,43 @@ def test_url_inventory_imports_same_site_text_urls_and_rejects_other_hosts(monke
         assert 'https://example.com/one' in urls
         assert 'https://example.com/relative-path' in urls
         assert 'https://other.com/two' not in urls
+
+
+def test_cloudflare_challenge_is_not_treated_as_real_page_content():
+    from seo_crawler import is_challenge_response
+    html = b'<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-platform">Checking your browser</div><a href="/real-page">Continue</a></body></html>'
+    response = fake_response(status=403)
+    response.headers['Server'] = 'cloudflare'
+    row, links, diag = extract_page(
+        'https://example.test/', response, 'https://example.test/', ['https://example.test/'],
+        html, 0, [], {}, reported_status=403,
+    )
+    assert is_challenge_response(403, html, response.headers) is True
+    assert links == []
+    assert row['Title 1'] == ''
+    assert row['Indexability'] == 'Blocked'
+    assert diag['extraction_status'] == 'blocked_challenge'
+    assert 'no seo metadata or links were extracted' in diag['note'].lower()
+
+
+def test_url_include_exclude_rules_are_applied_to_paths():
+    from seo_crawler import path_matches_rules
+    assert path_matches_rules('https://example.test/blog/post-a', ['/blog/*'])
+    assert path_matches_rules('https://example.test/checkout/cart', ['/checkout/*'])
+    assert not path_matches_rules('https://example.test/about', ['/blog/*'])
+
+
+def test_workbook_always_has_discovery_diagnostics_and_crawl_summary_sheets():
+    html=b'<html><head><title>Present</title><meta name="description" content="Present"></head><body><h1>Heading</h1></body></html>'
+    # A real requests.Response is required by extract_page for response metadata.
+    response=fake_response()
+    row, links, diag=extract_page('https://example.test/',response,'https://example.test/',[],html,0,[],{},reported_status=200)
+    with tempfile.TemporaryDirectory() as td:
+        out=Path(td)/'audit.xlsx'
+        write_excel([row],out,{'https://example.test/':diag},{'https://example.test/':{'Address':'https://example.test/','Visible text':'Heading'}},[{'URL':'https://example.test/','Discovery source':'seed_url'}],[],[])
+        wb=load_workbook(out,read_only=True,data_only=True)
+        assert 'Discovery Diagnostics' in wb.sheetnames
+        assert 'Crawl Summary' in wb.sheetnames
+        assert next(wb['Discovery Diagnostics'].iter_rows(values_only=True))[0] == 'Source type'
+        assert next(wb['Crawl Summary'].iter_rows(values_only=True))[0] == 'Metric'
+        wb.close()

@@ -1,4 +1,4 @@
-import argparse, csv, hashlib, ipaddress, json, math, re, socket, time, xml.etree.ElementTree as ET
+import argparse, csv, fnmatch, hashlib, ipaddress, json, math, re, socket, time, xml.etree.ElementTree as ET
 from collections import deque, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,8 +117,8 @@ def readability(score):
     if score>=30: return "Difficult"
     return "Very Difficult"
 
-def fetch_xml_or_feed_urls(session, seed_url, family, limit=100000):
-    """Read sitemap indexes, sitemap URL sets, RSS/Atom feeds; return (URL, source) pairs."""
+def fetch_xml_or_feed_urls(session, seed_url, family, limit=100000, source_diagnostics=None, source_kind="sitemap"):
+    """Read sitemap indexes and feeds; optionally record every source outcome."""
     queue=deque([(seed_url, "sitemap")]); seen=set(); found=[]
     while queue and len(found)<limit:
         sm, inherited_source=queue.popleft(); n=normalize(sm)
@@ -126,9 +126,13 @@ def fetch_xml_or_feed_urls(session, seed_url, family, limit=100000):
         seen.add(n)
         try:
             r=session.get(n,timeout=TIMEOUT,allow_redirects=True,headers={"User-Agent":UA},stream=True)
-            if r.status_code>=400: r.close(); continue
+            status_code=r.status_code; content_type=r.headers.get("Content-Type", "")
+            if status_code>=400:
+                if source_diagnostics is not None:
+                    source_diagnostics.append({"Source type":source_kind,"Source URL":n,"HTTP status":status_code,"URLs discovered":0,"Source status":"blocked_or_failed","Notes":f"HTTP {status_code}; source content was not available"})
+                r.close(); continue
             content=r.raw.read(MAX_BYTES,decode_content=True); r.close()
-            root=ET.fromstring(content)
+            before=len(found); before_queue=len(queue); root=ET.fromstring(content)
             root_name=root.tag.rsplit('}',1)[-1].lower()
             if root_name == 'sitemapindex':
                 for el in root.iter():
@@ -148,20 +152,25 @@ def fetch_xml_or_feed_urls(session, seed_url, family, limit=100000):
                             if tag=='link' and el.attrib.get('rel') not in (None,'alternate'): continue
                             u=normalize(urljoin(n,val))
                             if u and same_site(u,family): found.append((u,'feed'))
+            if source_diagnostics is not None:
+                discovered_delta=(len(found)-before)+(len(queue)-before_queue)
+                source_diagnostics.append({"Source type":source_kind,"Source URL":n,"HTTP status":status_code,"URLs discovered":discovered_delta,"Source status":"checked","Content type":content_type,"Notes":"Parsed successfully"})
             if len(found)>=limit: break
-        except (requests.RequestException, ET.ParseError, ValueError):
+        except (requests.RequestException, ET.ParseError, ValueError) as exc:
+            if source_diagnostics is not None:
+                source_diagnostics.append({"Source type":source_kind,"Source URL":n,"HTTP status":"","URLs discovered":0,"Source status":"failed","Notes":f"{type(exc).__name__}: {exc}"})
             continue
     return found[:limit]
 
-def sitemap_urls(session, origin, family, limit, robots_text=''):
+def sitemap_urls(session, origin, family, limit, robots_text='', source_diagnostics=None):
     seeds=[]
     for line in (robots_text or '').splitlines():
         m=re.match(r'\s*sitemap\s*:\s*(\S+)',line,re.I)
         if m: seeds.append(m.group(1))
     seeds.extend([urljoin(origin,'/sitemap.xml'),urljoin(origin,'/sitemap_index.xml')])
     out=[]; seen=set()
-    for seed in seeds:
-        for u,source in fetch_xml_or_feed_urls(session,seed,family,max(0,limit-len(out))):
+    for seed in dict.fromkeys(seeds):
+        for u,source in fetch_xml_or_feed_urls(session,seed,family,max(0,limit-len(out)),source_diagnostics=source_diagnostics,source_kind='sitemap'):
             if u not in seen: seen.add(u); out.append(u)
         if len(out)>=limit: break
     return out
@@ -238,6 +247,29 @@ def extract_extra_page_data(url, final_url, response, body, soup, links, rendere
     robots_meta=[]
     if soup:
         for tag in soup.find_all('meta',attrs={'name':re.compile(r'^(robots|googlebot|bingbot)$',re.I)}): robots_meta.append({'name':tag.get('name',''),'content':tag.get('content','')})
+    hreflang_links=[]
+    if soup:
+        for tag in soup.find_all('link',href=True):
+            rel=tag.get('rel',[]); rel=[rel] if isinstance(rel,str) else rel
+            if 'alternate' in [str(x).lower() for x in rel] and tag.get('hreflang'):
+                hreflang_links.append({'hreflang':tag.get('hreflang'),'url':urljoin(final_url,tag['href'])})
+    accessibility_signals={
+        'images_total':len(images),
+        'images_missing_alt':sum(1 for im in images if not im.get('alt_present') or not str(im.get('alt') or '').strip()),
+        'forms_total':len(forms),
+        'forms_with_unlabelled_fields':sum(1 for form in forms if not form.get('has_labelled_fields')),
+        'html_lang_missing':not bool(soup.html.get('lang','').strip()) if soup and soup.html else None,
+        'viewport_meta_present':bool(soup and soup.find('meta',attrs={'name':re.compile(r'^viewport$',re.I)})),
+        'h1_count':sum(1 for h in headings if h['level']==1),
+        'heading_order_observation':'See Headings JSON for full heading sequence; automated accessibility conformance is not claimed'
+    }
+    local_seo_signals={
+        'business_schema_present':any(any(k in str(obj.get('@type','')).lower() for k in ('localbusiness','organization','medicalbusiness','dentist')) for obj in schema if isinstance(obj,dict)),
+        'address_text_present':bool(soup and re.search(r'\b(address|street|postal|zip code)\b',text,re.I)),
+        'phone_text_present':bool(re.search(r'(?:\+?\d[\d().\s-]{7,}\d)',text)),
+        'map_link_present':bool(soup and any('maps.google.' in str(a.get('href','')).lower() or 'maps.app.goo.gl' in str(a.get('href','')).lower() for a in soup.find_all('a',href=True))),
+        'note':'Presence signals only; they do not verify business identity or NAP consistency'
+    }
     return {
       'Address':url,'Final URL':final_url,'HTTP status':response.status_code,'Content type':response.headers.get('Content-Type',''),
       'Response headers JSON':json.dumps(dict(response.headers),ensure_ascii=False),'Fetch timestamp UTC':utcnow(),
@@ -246,7 +278,7 @@ def extract_extra_page_data(url, final_url, response, body, soup, links, rendere
       'Title tags JSON':json.dumps([txt(t) for t in soup.find_all('title')] if soup else [],ensure_ascii=False),
       'Meta tags JSON':json.dumps(meta_all,ensure_ascii=False),'Headings JSON':json.dumps(headings,ensure_ascii=False),
       'H1 count':sum(1 for h in headings if h['level']==1),'H2 count':sum(1 for h in headings if h['level']==2),
-      'Canonical values JSON':json.dumps(canonicals,ensure_ascii=False),'Robots directives JSON':json.dumps(robots_meta,ensure_ascii=False),
+      'Canonical values JSON':json.dumps(canonicals,ensure_ascii=False),'Robots directives JSON':json.dumps(robots_meta,ensure_ascii=False),'Hreflang links JSON':json.dumps(hreflang_links,ensure_ascii=False),
       'X-Robots-Tag':response.headers.get('X-Robots-Tag',''),'Visible text':text,'Word count':len(visible_words),
       'Character count':len(text),'Paragraph count':len(soup.find_all('p')) if soup else 0,
       'Image data JSON':json.dumps(images,ensure_ascii=False),'Links data JSON':json.dumps(links_data,ensure_ascii=False),
@@ -258,8 +290,33 @@ def extract_extra_page_data(url, final_url, response, body, soup, links, rendere
       'Internal links found':sum(1 for l in links_data if same_site(l['url'],host_family(urlparse(url).hostname))),
       'External links found':sum(1 for l in links_data if not same_site(l['url'],host_family(urlparse(url).hostname))),
       'Response security headers JSON':json.dumps({h:response.headers.get(h,'') for h in ['Strict-Transport-Security','Content-Security-Policy','X-Content-Type-Options','Referrer-Policy','Permissions-Policy','X-Frame-Options']},ensure_ascii=False),
+      'Accessibility signals JSON':json.dumps(accessibility_signals,ensure_ascii=False),'Local SEO presence signals JSON':json.dumps(local_seo_signals,ensure_ascii=False),
+      'Performance measurement note':'HTTP response time and transferred bytes are measured; Core Web Vitals/Lighthouse require a separate authorised measurement integration',
       'Extraction status':'checked' if soup and response.status_code<400 and len(body)<MAX_BYTES else ('incomplete' if len(body)>=MAX_BYTES else 'not_applicable')
     }
+
+def is_challenge_response(status_code, body, headers=None):
+    """Detect common access challenges; never treat challenge HTML as page SEO content."""
+    if int(status_code or 0) not in (401, 403, 429, 503):
+        return False
+    sample=(body or b"")[:250000].decode("utf-8", errors="ignore").lower()
+    header_text=" ".join(f"{k}:{v}" for k,v in (headers or {}).items()).lower()
+    markers=("just a moment", "cf-chl-", "challenge-platform", "checking your browser",
+             "verify you are human", "attention required! | cloudflare", "cf-ray")
+    return any(marker in sample or marker in header_text for marker in markers)
+
+
+def path_matches_rules(url, patterns):
+    """Match include/exclude globs against URL path or full URL."""
+    parsed=urlparse(url); path=parsed.path or "/"
+    for pattern in patterns or []:
+        pat=str(pattern).strip()
+        if not pat or pat.startswith("#"):
+            continue
+        if fnmatch.fnmatch(path,pat) or fnmatch.fnmatch(url,pat):
+            return True
+    return False
+
 
 def extract_page(url, response, final_url, chain, body, depth, all_rows, inlinks, reported_status=None, rendered_body=None):
     ctype=response.headers.get("Content-Type","")
@@ -316,6 +373,14 @@ def extract_page(url, response, final_url, chain, body, depth, all_rows, inlinks
                 "External Outlinks":0,"Unique External Outlinks":0,"Unique External JS Outlinks":"",
                 "Closest Similarity Match":"","No. Near Duplicates":0,
                 "Spelling Errors":"","Grammar Errors":"","Hash":body_hash})
+    challenge=is_challenge_response(status_code, body, response.headers)
+    if status_code >= 400 or challenge:
+        row["Indexability"]="Blocked" if challenge or status_code in (401,403,429) else "Non-Indexable"
+        row["Indexability Status"]=("Access challenge detected; page content not assessed" if challenge else f"HTTP {status_code}; page content not assessed")
+        diagnostics.update({"extraction_status":"blocked_challenge" if challenge else "not_applicable",
+            "challenge_detected":bool(challenge),
+            "note":"Access challenge detected; no SEO metadata or links were extracted from this response" if challenge else f"HTTP {status_code}; SEO metadata and links were not assessed from an error response"})
+        return row, [], diagnostics
     links=[]
     if not soup:
         row["Indexability"]="Non-HTML"
@@ -393,7 +458,7 @@ def extract_page(url, response, final_url, chain, body, depth, all_rows, inlinks
     })
     return row,links,diagnostics
 
-def write_excel(rows, out, diagnostics=None, extra_rows=None, discovery_rows=None):
+def write_excel(rows, out, diagnostics=None, extra_rows=None, discovery_rows=None, discovery_diagnostics=None, crawl_summary=None):
     """Write every collected field; HEADERS is a baseline, not a column limit.
 
     New crawler fields are automatically appended to the main worksheet. Rich page
@@ -459,10 +524,11 @@ def write_excel(rows, out, diagnostics=None, extra_rows=None, discovery_rows=Non
             c.alignment=Alignment(wrap_text=True,vertical="center")
         dws.freeze_panes="A2"; dws.auto_filter.ref=dws.dimensions
         for i,h in enumerate(diag_headers,1): dws.column_dimensions[get_column_letter(i)].width=min(max(len(h)+2,14),42)
-    for sheet_name, records in [('Page Data', list((extra_rows or {}).values())), ('URL Discovery', list(discovery_rows or []))]:
-        if not records: continue
+    for sheet_name, records in [('Page Data', list((extra_rows or {}).values())), ('URL Discovery', list(discovery_rows or [])), ('Discovery Diagnostics', list(discovery_diagnostics or [])), ('Crawl Summary', list(crawl_summary or []))]:
+        if not records and sheet_name not in ('Discovery Diagnostics','Crawl Summary'): continue
         sh=wb.create_sheet(sheet_name)
         cols=list(dict.fromkeys(k for rec in records for k in rec.keys()))
+        if not cols: cols=['Metric','Value'] if sheet_name=='Crawl Summary' else ['Source type','Source URL','HTTP status','URLs discovered','Source status','Notes']
         sh.append(cols)
         for rec in records: sh.append([rec.get(k,'') for k in cols])
         for c in sh[1]:
@@ -518,26 +584,41 @@ def render_page_html(url, timeout=25):
     except Exception as exc:
         return None, f"JavaScript rendering failed: {type(exc).__name__}: {exc}"
 
-def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=None,render_js=False,url_files=None,previous_report=None,feed_urls=None):
+def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=None,render_js=False,url_files=None,previous_report=None,feed_urls=None,respect_robots=True,user_agent=UA,include_patterns=None,exclude_patterns=None):
     start=normalize(start_url)
     if not start: raise SystemExit("Please enter a full public URL starting with https:// or http://")
     family=host_family(urlparse(start).hostname)
     origin=f"{urlparse(start).scheme}://{urlparse(start).netloc}"
-    session=requests.Session(); session.headers.update({"User-Agent":UA,"Accept":"text/html,application/xhtml+xml,*/*;q=0.8"})
-    robots=RobotFileParser()
+    ua=(str(user_agent or UA).strip() or UA)[:300]
+    session=requests.Session(); session.headers.update({"User-Agent":ua,"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
+    robots=RobotFileParser(); source_diagnostics=[]; robots_text=""; robots_state="unknown"
     try:
-        rr=session.get(origin+"/robots.txt",timeout=TIMEOUT,allow_redirects=False)
-        if 300 <= rr.status_code < 400:
-            raise SystemExit("robots.txt returned a redirect. Please verify the site's robots.txt URL before crawling.")
-        robots.parse(rr.text.splitlines() if rr.status_code<400 else [])
-    except requests.RequestException:
-        raise SystemExit("Could not fetch robots.txt. Crawl stopped.")
+        rr=session.get(origin+"/robots.txt",timeout=TIMEOUT,allow_redirects=True)
+        if 200 <= rr.status_code < 300:
+            robots_text=rr.text; robots.parse(robots_text.splitlines()); robots_state="checked"
+            source_diagnostics.append({"Source type":"robots.txt","Source URL":rr.url,"HTTP status":rr.status_code,"URLs discovered":len(re.findall(r"(?im)^\s*sitemap\s*:",robots_text)),"Source status":"checked","Notes":"Robots directives parsed"})
+        elif 400 <= rr.status_code < 500:
+            robots.parse([]); robots_state="unavailable_4xx"
+            source_diagnostics.append({"Source type":"robots.txt","Source URL":rr.url,"HTTP status":rr.status_code,"URLs discovered":0,"Source status":"unavailable","Notes":f"robots.txt returned HTTP {rr.status_code}; no directives could be read"})
+        else:
+            robots.parse(["User-agent: *", "Disallow: /"]); robots_state="unavailable_server_error"
+            source_diagnostics.append({"Source type":"robots.txt","Source URL":rr.url,"HTTP status":rr.status_code,"URLs discovered":0,"Source status":"unavailable","Notes":f"robots.txt returned HTTP {rr.status_code}; crawling disallowed conservatively because rules could not be verified"})
+        rr.close()
+    except requests.RequestException as exc:
+        robots.parse(["User-agent: *", "Disallow: /"]); robots_state="unreachable"
+        source_diagnostics.append({"Source type":"robots.txt","Source URL":origin+"/robots.txt","HTTP status":"","URLs discovered":0,"Source status":"unavailable","Notes":f"Could not verify robots rules: {type(exc).__name__}: {exc}; crawling disallowed conservatively"})
     queue=deque(); queued=set(); visited=set(); depths={}; rows=[]; diagnostics={}; extra_rows={}; discovery_rows=[]; discovery_sources=defaultdict(set); incoming_total=defaultdict(int); incoming_sources=defaultdict(set); discovered_links={}; fetch_errors=0
     write_progress(progress_path, status="running", crawled=0, max_pages=max_pages, message="Starting crawl", queued=len(queue))
+    include_rules=[str(x).strip() for x in (include_patterns or []) if str(x).strip()]
+    exclude_rules=[str(x).strip() for x in (exclude_patterns or []) if str(x).strip()]
     def enqueue(raw,depth):
         u=normalize(urljoin(start,raw))
         if not u or not same_site(u,family) or urlparse(u).path.lower().endswith(NON_HTML):
             return
+        if include_rules and not path_matches_rules(u,include_rules):
+            discovery_sources[u].add("excluded_by_include_rules"); return
+        if path_matches_rules(u,exclude_rules):
+            discovery_sources[u].add("excluded_by_exclude_rules"); return
         if depth is not None:
             old=depths.get(u)
             if old is None or depth < old:
@@ -547,7 +628,7 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
         return u
     enqueue(start,0); discovery_sources[start].add('seed_url')
     if use_sitemap:
-        for u in sitemap_urls(session,origin,family,max_pages*20,rr.text):
+        for u in sitemap_urls(session,origin,family,max_pages*20,robots_text,source_diagnostics):
             enqueue(u,None); discovery_sources[u].add('sitemap_or_robots_sitemap')
     for path in (url_files or []):
         for u,src in load_url_inventory(path,start,family,'manual_import:'+str(path)):
@@ -556,8 +637,15 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
         for u,src in load_url_inventory(previous_report,start,family,'previous_crawl'):
             enqueue(u,None); discovery_sources[u].add(src)
     for feed in (feed_urls or []):
-        for u,src in fetch_xml_or_feed_urls(session,urljoin(origin,feed),family,max_pages*10):
+        for u,src in fetch_xml_or_feed_urls(session,urljoin(origin,feed),family,max_pages*10,source_diagnostics=source_diagnostics,source_kind="feed"):
             enqueue(u,None); discovery_sources[u].add(src)
+    source_diagnostics.append({"Source type":"seed URL","Source URL":start,"HTTP status":"","URLs discovered":1,"Source status":"queued","Notes":"Project start URL added to crawl queue"})
+    for integration in ("Google Search Console","Google Analytics 4","Backlink provider","CMS inventory","Server logs"):
+        source_diagnostics.append({"Source type":integration,"Source URL":"","HTTP status":"","URLs discovered":0,"Source status":"not_connected","Notes":"No authorised integration is configured; no external data was collected or fabricated"})
+    if url_files:
+        source_diagnostics.append({"Source type":"manual URL import","Source URL":"; ".join(str(x) for x in url_files),"HTTP status":"","URLs discovered":sum(1 for srcs in discovery_sources.values() if any(str(v).startswith('manual_import:') for v in srcs)),"Source status":"processed","Notes":"Only public same-site URLs are accepted"})
+    if previous_report:
+        source_diagnostics.append({"Source type":"previous crawl","Source URL":str(previous_report),"HTTP status":"","URLs discovered":sum(1 for srcs in discovery_sources.values() if 'previous_crawl' in srcs),"Source status":"processed","Notes":"Imported same-site URLs from prior workbook where available"})
     # A robots.txt sitemap may be cross-host; only same-site URLs are crawled by default.
     for u in queued:
         discovery_rows.append({'URL':u,'Discovery source':' ; '.join(sorted(discovery_sources.get(u,{'unknown'}))),'Source count':len(discovery_sources.get(u,set())),'Discovery status':'queued'})
@@ -566,7 +654,7 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
         url=queue.popleft()
         if url in visited: continue
         visited.add(url)
-        if not robots.can_fetch(UA,url):
+        if respect_robots and not robots.can_fetch(ua,url):
             row={h:"" for h in HEADERS}; row.update({"Address":url,"Indexability":"Blocked","Indexability Status":"Disallowed by robots.txt","Crawl Depth":depths.get(url,0),"Crawl Timestamp":utcnow()})
             rows.append(row)
             diagnostics[url]={"Address":url,"status_code":"","content_type":"","html_detected":False,"extraction_status":"blocked_by_robots","body_truncated":False,"raw_bytes_read":0,"declared_bytes":"","rendered_checked":False,"title_tags_raw":0,"meta_description_tags_raw":0,"h1_tags_raw":0,"title_raw":"","meta_description_raw":"","h1_raw":"","title_selected":"","meta_description_selected":"","h1_selected":"","open_graph_description_present":False,"note":"Not fetched because robots.txt disallows this URL"}
@@ -594,7 +682,8 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
                         chain.append(nxt)
             body=response.raw.read(MAX_BYTES,decode_content=True)
             rendered_body=None; render_error=""
-            if render_js and 200 <= first_status < 300 and is_html_response(response.headers.get("Content-Type",""),body):
+            challenge=is_challenge_response(first_status,body,response.headers)
+            if render_js and 200 <= first_status < 300 and not challenge and is_html_response(response.headers.get("Content-Type",""),body):
                 rendered_body,render_error=render_page_html(url)
             row,links,diag=extract_page(url,response,url,chain,body,depths.get(url,""),rows,incoming_sources,reported_status=first_status,rendered_body=rendered_body)
             diag["render_error"]=render_error
@@ -605,8 +694,11 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
             diag["response_headers_json"]=json.dumps(dict(response.headers),ensure_ascii=False)
             diagnostics[url]=diag
             try:
-                selected_soup=BeautifulSoup(rendered_body or body, "lxml") if is_html_response(response.headers.get("Content-Type",""),rendered_body or body) else None
+                selected_soup=BeautifulSoup(rendered_body or body, "lxml") if 200 <= first_status < 300 and not challenge and is_html_response(response.headers.get("Content-Type",""),rendered_body or body) else None
                 extra_rows[url]=extract_extra_page_data(url,url,response,body,selected_soup,links,rendered_body)
+                if challenge:
+                    extra_rows[url]["Extraction status"]="blocked_challenge"
+                    extra_rows[url]["Extraction notes"]="Access challenge detected; SEO content was not assessed. Ask the site owner to allow the authorised crawler."
                 extra_rows[url]["Final URL"]="" if redirect_codes else url
                 extra_rows[url]["Redirect destination observed"]=current if current != url else ""
                 extra_rows[url]["Redirect chain observed"]=" -> ".join(chain)
@@ -625,6 +717,7 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
                     parent_depth=depths.get(url)
                     enqueue(current,(parent_depth+1) if isinstance(parent_depth,int) else None)
             discovered_links[url]=links
+            source_diagnostics.append({"Source type":"rendered internal links" if rendered_body else "raw internal links","Source URL":url,"HTTP status":first_status,"URLs discovered":len(links),"Source status":"checked" if 200 <= first_status < 300 and not challenge else ("blocked" if challenge or first_status in (401,403,429) else "not_applicable"),"Notes":("Links extracted from rendered DOM" if rendered_body else "Links extracted from raw HTML") if 200 <= first_status < 300 and not challenge else ("Access challenge; links not extracted" if challenge else f"HTTP {first_status}; links not extracted")})
             for target in links:
                 if same_site(target,family):
                     discovery_sources[target].add("rendered_internal_link" if rendered_body else "raw_internal_link")
@@ -702,8 +795,11 @@ def run_crawl(start_url,max_pages,delay,output,use_sitemap=True,progress_path=No
     incoming_set=set(incoming_sources)
     for rec in discovery_rows:
         rec['Orphan candidate']='yes' if rec.get('URL') in crawled_set and rec.get('URL')!=start and rec.get('URL') not in incoming_set else ('not_assessed' if rec.get('URL') not in crawled_set else 'no')
-    write_excel(rows,output,diagnostics,extra_rows,discovery_rows)
-    write_progress(progress_path, status="finished", crawled=len(visited), max_pages=max_pages, current_url="", message=f"Finished: {len(rows)} report rows", errors=fetch_errors, queued=0)
+    successful_pages=sum(1 for r in rows if 200 <= int(r.get("Status Code") or 0) < 300 and diagnostics.get(r.get("Address"),{}).get("extraction_status")=="checked")
+    blocked_pages=sum(1 for r in rows if diagnostics.get(r.get("Address"),{}).get("extraction_status")=="blocked_challenge" or int(r.get("Status Code") or 0) in (401,403,429,503) or str(r.get("Indexability Status","")).startswith("Disallowed by robots"))
+    crawl_summary=[{"Metric":"Start URL","Value":start},{"Metric":"URLs discovered/queued","Value":len(queued)},{"Metric":"URLs attempted","Value":len(visited)},{"Metric":"Successful pages with checked extraction","Value":successful_pages},{"Metric":"Blocked/challenge URLs","Value":blocked_pages},{"Metric":"Fetch errors","Value":fetch_errors},{"Metric":"Max URL limit","Value":max_pages},{"Metric":"robots.txt status","Value":robots_state},{"Metric":"Respect robots.txt","Value":bool(respect_robots)},{"Metric":"JavaScript rendering requested","Value":bool(render_js)},{"Metric":"User-Agent","Value":ua},{"Metric":"Crawl quality","Value":"incomplete_blocked" if blocked_pages and not successful_pages else ("usable_partial" if blocked_pages else ("usable" if successful_pages else "no_successful_extractions"))}]
+    write_excel(rows,output,diagnostics,extra_rows,discovery_rows,source_diagnostics,crawl_summary)
+    write_progress(progress_path, status="finished", crawled=len(visited), max_pages=max_pages, current_url="", message=f"Finished: {len(rows)} URLs; {successful_pages} successfully extracted; {blocked_pages} blocked/challenge URLs", errors=fetch_errors, queued=0)
     print(f"FINISHED {len(rows)} pages. Excel report: {output}", flush=True)
     return len(rows)
 
@@ -717,11 +813,15 @@ def main():
     p.add_argument("--url-file",action="append",default=[],help="Import additional URLs from .txt, .csv, or .xlsx; repeatable")
     p.add_argument("--previous-report",default="",help="Import URLs from a previous Rankpilot/Excel crawl report")
     p.add_argument("--feed",action="append",default=[],help="Additional same-site RSS/Atom feed URL; repeatable")
+    p.add_argument("--ignore-robots",action="store_true",help="Ignore robots.txt only when explicitly authorised by the site owner")
+    p.add_argument("--user-agent",default=UA,help="Crawler user-agent string")
+    p.add_argument("--include",action="append",default=[],help="Include URL path/full-URL glob; repeatable")
+    p.add_argument("--exclude",action="append",default=[],help="Exclude URL path/full-URL glob; repeatable")
     a=p.parse_args()
     if not 1<=a.max_pages<=100000: p.error("--max-pages must be between 1 and 100000")
     if a.delay<0.5: p.error("--delay must be at least 0.5 seconds")
     try:
-        run_crawl(a.url,a.max_pages,a.delay,a.output,not a.no_sitemap,a.progress or None,a.render_js,a.url_file,a.previous_report or None,a.feed)
+        run_crawl(a.url,a.max_pages,a.delay,a.output,not a.no_sitemap,a.progress or None,a.render_js,a.url_file,a.previous_report or None,a.feed,not a.ignore_robots,a.user_agent,a.include,a.exclude)
     except Exception as exc:
         write_progress(a.progress or None, status="failed", crawled=0, max_pages=a.max_pages, message=str(exc))
         raise
