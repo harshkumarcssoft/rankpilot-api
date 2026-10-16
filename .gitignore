@@ -1,0 +1,17 @@
+# Local Python environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Node dependencies/build output
+node_modules/
+dist/
+
+# Local crawl data and generated reports
+data/
+*.sqlite3
+*.db
+*.xlsx
+*.csv
+*.log
+.env
