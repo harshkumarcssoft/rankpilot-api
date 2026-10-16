@@ -1,0 +1,2 @@
+# Optional JavaScript rendering support
+playwright>=1.50.0
