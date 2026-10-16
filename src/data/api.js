@@ -1,35 +1,47 @@
 /**
- * API boundary for the SEO audit UI.
- * Components should consume these normalized models rather than depend on crawler internals.
- * Configure VITE_API_BASE_URL when a real backend is available.
+ * Shared RankPilot API client. Route names mirror api.py.
+ * Production: set VITE_API_BASE_URL to the Render API base URL (including /api).
  */
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '');
+const configuredApiBase = (import.meta.env.VITE_API_BASE_URL || '').trim();
+const selectedApiBase = configuredApiBase || (import.meta.env.DEV ? '/api' : 'https://rankpilot-api-ovfh.onrender.com/api');
+const trimmedApiBase = selectedApiBase.replace(/\/+$/, '');
+const API_BASE = trimmedApiBase === '/api' || /\/api$/i.test(trimmedApiBase) ? trimmedApiBase : `${trimmedApiBase}/api`;
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
-    ...options,
-  });
-  if (!response.ok) throw new Error(`API request failed (${response.status})`);
-  return response.status === 204 ? null : response.json();
+  const url = `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
+    });
+  } catch (error) {
+    throw new Error(`Could not reach RankPilot API at ${url}: ${error?.message || 'network or CORS error'}`);
+  }
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try { payload = JSON.parse(text); }
+    catch { throw new Error(`RankPilot API returned non-JSON (HTTP ${response.status}) at ${url}: ${text.replace(/\s+/g, ' ').slice(0, 180)}`); }
+  }
+  if (!response.ok) {
+    const detail = payload && typeof payload === 'object' ? (payload.detail || payload.message) : '';
+    throw new Error(detail || `RankPilot API request failed (HTTP ${response.status}) at ${url}`);
+  }
+  return payload;
 }
 
 export const auditApi = {
+  health: () => request('/health'),
   projects: () => request('/projects'),
+  createProject: (payload) => request('/projects', { method: 'POST', body: JSON.stringify(payload) }),
+  deleteProject: (projectId) => request(`/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' }),
   crawls: (projectId) => request(`/projects/${encodeURIComponent(projectId)}/crawls`),
+  startCrawl: (projectId, payload) => request(`/projects/${encodeURIComponent(projectId)}/crawls`, { method: 'POST', body: JSON.stringify(payload) }),
   pages: (crawlId, params = {}) => request(`/crawls/${encodeURIComponent(crawlId)}/pages?${new URLSearchParams(params)}`),
-  issues: (crawlId, params = {}) => request(`/crawls/${encodeURIComponent(crawlId)}/issues?${new URLSearchParams(params)}`),
-  crawl: (payload) => request('/crawls', { method: 'POST', body: JSON.stringify(payload) }),
+  sheets: (crawlId) => request(`/crawls/${encodeURIComponent(crawlId)}/sheets`),
+  sheetData: (crawlId, sheetName, params = {}) => request(`/crawls/${encodeURIComponent(crawlId)}/sheets/${encodeURIComponent(sheetName)}?${new URLSearchParams(params)}`),
   progress: (crawlId) => request(`/crawls/${encodeURIComponent(crawlId)}/progress`),
-  pause: (crawlId) => request(`/crawls/${encodeURIComponent(crawlId)}/pause`, { method: 'POST' }),
-  resume: (crawlId) => request(`/crawls/${encodeURIComponent(crawlId)}/resume`, { method: 'POST' }),
   stop: (crawlId) => request(`/crawls/${encodeURIComponent(crawlId)}/stop`, { method: 'POST' }),
-  compare: (crawlA, crawlB) => request(`/crawls/compare?${new URLSearchParams({ a: crawlA, b: crawlB })}`),
-};
-
-/** JSON model contract shared by the frontend and crawler API. */
-export const auditSchema = {
-  page: ['url', 'status', 'indexability', 'title', 'titleLength', 'meta', 'metaLength', 'h1', 'wordCount', 'canonical', 'depth', 'inlinks', 'outlinks', 'response', 'size', 'issues'],
-  issue: ['name', 'category', 'severity', 'url', 'evidence', 'fix', 'status'],
-  crawlProgress: ['crawlId', 'state', 'crawled', 'queued', 'speedPerSecond', 'etaSeconds', 'updatedAt'],
+  downloadUrl: (crawlId) => `${API_BASE}/crawls/${encodeURIComponent(crawlId)}/download`,
 };

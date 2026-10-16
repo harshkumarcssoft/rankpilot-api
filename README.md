@@ -7,6 +7,17 @@ This package has the application files at the repository root (not nested inside
 
 This build connects the React/Vite dashboard to the existing Python SEO crawler through a local FastAPI service. Projects and crawl history are saved in a local SQLite database. Crawl reports retain the `1 - All` worksheet, keep baseline fields first, and automatically include every additional collected field; there is no fixed 75-column limit.
 
+
+## Deployment (Vercel frontend + Render API)
+
+1. Deploy this repository's Python API as a Render **Web Service**. Use build command `pip install -r requirements.txt` and start command `uvicorn api:app --host 0.0.0.0 --port $PORT`.
+2. Wait until Render says **Live**. Test `https://YOUR-RENDER-HOST.onrender.com/api/health`; it should return JSON with `"ok": true`.
+3. In the Vercel **frontend project** (not Team Settings), add `VITE_API_BASE_URL` with value `https://YOUR-RENDER-HOST.onrender.com/api` for Production, then redeploy. This code has a fallback to the known Render URL if the variable is absent, but setting it explicitly is recommended.
+4. The API allows HTTPS Vercel deployment domains through CORS. If using a custom frontend domain, add it to Render's `CORS_ORIGINS` environment variable as a comma-separated list of full origins, for example `https://rankpilot-api-mu.vercel.app,https://your-custom-domain.example`.
+5. If you update API code, redeploy Render. If you update frontend code or Vercel environment variables, redeploy Vercel.
+
+**Important security and persistence warning:** this prototype API does not have login/authentication or per-user authorization and should not be used for confidential client data or unrestricted public access. Render's local filesystem is ephemeral unless you configure persistent storage; a process-local crawler queue also is not a durable job queue. Before production use, add authentication, quotas, hardened SSRF controls, persistent database/report storage, and background workers.
+
 ## Requirements
 
 - Node.js LTS (for the React dashboard)
@@ -71,7 +82,7 @@ Open the local URL Vite prints, normally `http://localhost:5173/`.
 - Crawl depth and link metrics are finalized at the end of a crawl; interim dashboard data can be partial until the crawl completes.
 - This crawler does not render JavaScript and does not implement true pause/resume. Stop is supported.
 - The queue count reflects URLs currently waiting in the crawler queue; the ETA is an estimate based on observed speed and the requested limit.
-- This local build is for development and internal testing. The API is deliberately bound to `127.0.0.1` and has no user authentication. Do not expose it to the internet or share it with external clients as-is. Before client-facing hosting, add authentication, per-user/project authorization, crawl quotas, stronger SSRF protections, and managed report storage.
+- The API has no user authentication or per-user/project authorization. Do not use it for confidential client data or unrestricted public access as-is. Before production use, add authentication, crawl quotas, stronger SSRF protections, durable job processing, and managed report storage.
 - The PDF control uses browser print-to-PDF. Some advanced dashboard panels are only as complete as the source crawler data.
 
 ## API endpoints
@@ -124,4 +135,4 @@ Then open Settings in the dashboard, enable **JavaScript rendering**, and start 
 - Historical comparison UI no longer shows invented sample numbers. Automated crawl-to-crawl diffing remains unimplemented and is labelled as such.
 - External Search Console / Analytics integrations are labelled disconnected until credentials and integration code are configured.
 
-Validation performed: Python compilation passed; the crawler and dashboard-workbook API test suite passed (7 tests). A production Vite build could not be verified because npm dependency installation timed out in this environment.
+Validation performed for this package: Python compilation passed; 10 API/crawler tests passed, including project creation, JSON health responses, workbook endpoints, and a Vercel-origin CORS preflight. A production Vite build could not be verified in this environment because the npm registry could not be reached (DNS `EAI_AGAIN`), so run the Vercel build after uploading. The live Render/Vercel deployment has not been tested from this package build.

@@ -31,7 +31,16 @@ app=FastAPI(title="Rankpilot SEO Crawler API", version="0.3.0")
 # as a comma-separated CORS_ORIGINS environment variable on Render if needed.
 _default_origins = "http://localhost:5173,http://127.0.0.1:5173,https://rankpilot-api-mu.vercel.app"
 _allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", _default_origins).split(",") if origin.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=False, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["*"])
+# Vercel creates unique deployment aliases. Allow HTTPS Vercel origins in addition
+# to the explicit production domain; custom domains can be added via CORS_ORIGINS.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*vercel\.app",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 class ProjectIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -58,6 +67,9 @@ def validate_public_url(raw):
 
 def project_dict(r): return {"id":r["id"],"name":r["name"],"url":r["url"],"created_at":r["created_at"]}
 def crawl_dict(r): return {"id":r["id"],"project_id":r["project_id"],"started_at":r["started_at"],"status":r["status"],"max_pages":r["max_pages"],"delay":r["delay"]}
+
+@app.get('/')
+def root(): return {"ok": True, "service": "rankpilot-crawler-api", "health": "/api/health", "docs": "/docs"}
 
 @app.get('/api/health')
 def health(): return {"ok":True,"service":"rankpilot-crawler-api","time":now()}
